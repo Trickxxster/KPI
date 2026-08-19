@@ -107,7 +107,7 @@ def parse_excel(file):
 
 
 # ------------------------------------------------------------
-# 2. Расчёт KPI (с учётом количества дней во втором месяце)
+# 2. Расчёт KPI (всё в штуках)
 # ------------------------------------------------------------
 def calculate_kpi(df_month1, df_month2,
                   days_in_month2,
@@ -120,23 +120,25 @@ def calculate_kpi(df_month1, df_month2,
     df_month2 – данные за второй месяц (отчётный)
     days_in_month2 – количество дней во втором месяце
     """
-    # --- In-Stock Retail ---
+    # --- In-Stock Retail (по категории в целом) ---
     cities = df_month2['Город'].unique()
     total_cities = len(cities)
     cities_with_stock = df_month2[df_month2['Остаток'] > 0]['Город'].nunique()
     in_stock_pct = (cities_with_stock / total_cities) * 100 if total_cities > 0 else 0
     in_stock_ok = in_stock_pct >= target_in_stock
 
-    # --- Оборачиваемость ---
-    cost_sales_month2 = df_month2['Себестоимость_продажи'].sum()
-    opening_stock = df_month1['Остаток_по_себест'].sum()   # остаток на начало отчётного месяца
-    closing_stock = df_month2['Остаток_по_себест'].sum()
-    avg_stock = (opening_stock + closing_stock) / 2
-    if cost_sales_month2 > 0:
-        turnover = (avg_stock / cost_sales_month2) * days_in_month2
+    # --- Оборачиваемость (в штуках) ---
+    # Остаток на начало отчётного месяца = остаток на конец первого месяца (сумма по всем городам)
+    opening_stock_qty = df_month1['Остаток'].sum()
+    closing_stock_qty = df_month2['Остаток'].sum()
+    avg_stock_qty = (opening_stock_qty + closing_stock_qty) / 2
+    # Среднедневные продажи за отчётный месяц (сумма по всем городам)
+    avg_daily_sales = df_month2['Ср_продажа'].sum()
+    if avg_daily_sales > 0:
+        turnover_days = avg_stock_qty / avg_daily_sales
     else:
-        turnover = float('inf')
-    turnover_ok = turnover <= target_turnover
+        turnover_days = float('inf')
+    turnover_ok = turnover_days <= target_turnover
 
     # --- Упущенная прибыль (в штуках) ---
     df_month2['Недопроданное'] = df_month2.apply(
@@ -149,7 +151,8 @@ def calculate_kpi(df_month1, df_month2,
     lost_profit_pct = (total_lost_qty / total_demand * 100) if total_demand > 0 else 0
     lost_profit_ok = lost_profit_pct <= limit_lost_profit
 
-    # --- Неликвид (товары без продаж за два месяца) ---
+    # --- Неликвид (в штуках) ---
+    # Группируем продажи по товарам за первый и второй месяц
     sales_m1 = df_month1.groupby(['Номенклатура', 'Характеристика'])['Количество'].sum().reset_index()
     sales_m2 = df_month2.groupby(['Номенклатура', 'Характеристика'])['Количество'].sum().reset_index()
     merged = pd.merge(sales_m1, sales_m2, on=['Номенклатура', 'Характеристика'],
@@ -157,13 +160,13 @@ def calculate_kpi(df_month1, df_month2,
     dead_items = merged[(merged['Количество_m1'] == 0) & (merged['Количество_m2'] == 0)]
     dead_keys = set(zip(dead_items['Номенклатура'], dead_items['Характеристика']))
 
-    dead_stock_cost = 0
+    dead_stock_qty = 0
     for _, row in df_month2.iterrows():
         if (row['Номенклатура'], row['Характеристика']) in dead_keys:
-            dead_stock_cost += row['Остаток_по_себест']
+            dead_stock_qty += row['Остаток']
 
-    total_stock_cost = df_month2['Остаток_по_себест'].sum()
-    dead_stock_pct = (dead_stock_cost / total_stock_cost * 100) if total_stock_cost > 0 else 0
+    total_stock_qty = df_month2['Остаток'].sum()
+    dead_stock_pct = (dead_stock_qty / total_stock_qty * 100) if total_stock_qty > 0 else 0
     dead_stock_ok = dead_stock_pct <= limit_dead_stock
 
     # --- Итоговая премия ---
@@ -185,7 +188,7 @@ def calculate_kpi(df_month1, df_month2,
     result = {
         'in_stock_pct': in_stock_pct,
         'in_stock_ok': in_stock_ok,
-        'turnover': turnover,
+        'turnover_days': turnover_days,
         'turnover_ok': turnover_ok,
         'lost_profit_pct': lost_profit_pct,
         'lost_profit_ok': lost_profit_ok,
@@ -196,14 +199,14 @@ def calculate_kpi(df_month1, df_month2,
         'stop_factors_ok': stop_factors_ok,
         'cities_with_stock': cities_with_stock,
         'total_cities': total_cities,
-        'cost_sales_month2': cost_sales_month2,
-        'opening_stock': opening_stock,
-        'closing_stock': closing_stock,
-        'avg_stock': avg_stock,
+        'opening_stock_qty': opening_stock_qty,
+        'closing_stock_qty': closing_stock_qty,
+        'avg_stock_qty': avg_stock_qty,
+        'avg_daily_sales': avg_daily_sales,
         'total_lost_qty': total_lost_qty,
         'total_sales_qty': total_sales_qty,
-        'dead_stock_cost': dead_stock_cost,
-        'total_stock_cost': total_stock_cost,
+        'dead_stock_qty': dead_stock_qty,
+        'total_stock_qty': total_stock_qty,
         'dead_items_count': len(dead_keys),
         'days_in_month2': days_in_month2
     }
@@ -211,7 +214,46 @@ def calculate_kpi(df_month1, df_month2,
 
 
 # ------------------------------------------------------------
-# 3. Интерфейс Streamlit
+# 3. Детальный расчёт оборачиваемости по товарам и городам
+# ------------------------------------------------------------
+def compute_detailed_turnover(df_month1, df_month2, days_in_month2, target_turnover):
+    """
+    Возвращает DataFrame с детальной оборачиваемостью по каждому товару+городу
+    """
+    # Собираем остатки на начало (из первого месяца) и на конец (из второго)
+    # Объединяем по (Номенклатура, Характеристика, Город)
+    merged = pd.merge(
+        df_month1[['Номенклатура', 'Характеристика', 'Город', 'Остаток']],
+        df_month2[['Номенклатура', 'Характеристика', 'Город', 'Остаток', 'Ср_продажа', 'Количество']],
+        on=['Номенклатура', 'Характеристика', 'Город'],
+        how='outer',
+        suffixes=('_нач', '_кон')
+    ).fillna(0)
+
+    # Средний остаток за месяц
+    merged['Средний_остаток'] = (merged['Остаток_нач'] + merged['Остаток_кон']) / 2
+    # Вычисляем оборачиваемость в днях
+    merged['Оборачиваемость_дни'] = merged.apply(
+        lambda row: row['Средний_остаток'] / row['Ср_продажа'] if row['Ср_продажа'] > 0 else float('inf'),
+        axis=1
+    )
+    # Флаг превышения
+    merged['Превышение'] = merged['Оборачиваемость_дни'] > target_turnover
+    # Для удобства переименуем колонки
+    merged.rename(columns={
+        'Остаток_нач': 'Остаток_на_начало_месяца_шт',
+        'Остаток_кон': 'Остаток_на_конец_месяца_шт',
+        'Ср_продажа': 'Среднедневные_продажи_шт',
+        'Количество': 'Продано_за_месяц_шт'
+    }, inplace=True)
+
+    # Сортируем по убыванию оборачиваемости (самые проблемные сверху)
+    merged = merged.sort_values('Оборачиваемость_дни', ascending=False)
+    return merged
+
+
+# ------------------------------------------------------------
+# 4. Интерфейс Streamlit
 # ------------------------------------------------------------
 st.set_page_config(page_title="KPI Категорийного менеджера", layout="wide")
 st.title("📊 Оценка эффективности категорийного менеджера")
@@ -237,12 +279,11 @@ st.caption("Структура файлов должна строго соотв
 # Выбор месяцев
 col_m1, col_m2 = st.columns(2)
 with col_m1:
-    month1_num = st.selectbox("Выберите первый месяц (предыдущий)", options=list(month_names.keys()), format_func=lambda x: month_names[x], index=5)  # июнь по умолчанию
+    month1_num = st.selectbox("Выберите первый месяц (предыдущий)", options=list(month_names.keys()), format_func=lambda x: month_names[x], index=5)
 with col_m2:
-    month2_num = st.selectbox("Выберите второй месяц (отчётный)", options=list(month_names.keys()), format_func=lambda x: month_names[x], index=6)  # июль по умолчанию
+    month2_num = st.selectbox("Выберите второй месяц (отчётный)", options=list(month_names.keys()), format_func=lambda x: month_names[x], index=6)
 
-# Получаем количество дней для второго месяца
-days_in_month2 = monthrange(2026, month2_num)[1]  # используем фиксированный год (например, 2026), но если нужен текущий, можно взять из даты, но для простоты оставим так.
+days_in_month2 = monthrange(2026, month2_num)[1]  # год можно задать динамически, но для простоты оставим 2026
 
 st.write(f"**Количество дней во втором месяце ({month_names[month2_num]}):** {days_in_month2}")
 
@@ -265,73 +306,119 @@ if st.button("🚀 Рассчитать KPI"):
                     st.error("Не удалось распознать структуру файлов. Проверьте формат.")
                     st.stop()
 
+                # Основной расчёт
                 result = calculate_kpi(df_m1, df_m2, days_in_month2,
                                        target_in_stock, target_turnover,
                                        limit_lost_profit, limit_dead_stock)
 
-                st.success("✅ Расчёт выполнен!")
+                # Детальная оборачиваемость
+                detailed_turnover = compute_detailed_turnover(df_m1, df_m2, days_in_month2, target_turnover)
 
-                # --- Общий итог по премии ---
-                st.header("💰 Итоговая премия")
-                if result['bonus'] > 0:
-                    st.success(f"**{result['bonus']:,} руб.**")
-                else:
-                    st.error(f"**{result['bonus']} руб.**")
-                st.caption(result['bonus_detail'])
+                # Создаём вкладки
+                tab1, tab2 = st.tabs(["📈 Основные KPI", "🔍 Детали оборачиваемости"])
 
-                # --- KPI ---
-                st.subheader("🎯 Драйверные KPI")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric(
-                        label="In‑Stock Retail",
-                        value=f"{result['in_stock_pct']:.1f}%",
-                        delta=f"Цель: {target_in_stock}%",
-                        delta_color="normal" if result['in_stock_ok'] else "inverse"
-                    )
-                    st.caption(f"Городов с наличием: {result['cities_with_stock']} из {result['total_cities']}")
-                with col2:
-                    st.metric(
-                        label="Оборачиваемость (дни)",
-                        value=f"{result['turnover']:.1f}" if result['turnover'] != float('inf') else "∞",
-                        delta=f"Цель: ≤ {target_turnover}",
-                        delta_color="normal" if result['turnover_ok'] else "inverse"
-                    )
-                    st.caption(f"Себестоимость продаж: {result['cost_sales_month2']:,.0f} руб.")
+                with tab1:
+                    st.success("✅ Расчёт выполнен!")
 
-                # --- Стоп-факторы ---
-                st.subheader("⛔ Стоп-факторы (обнуляют премию)")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric(
-                        label="Упущенная прибыль (доля недопроданных штук)",
-                        value=f"{result['lost_profit_pct']:.2f}%",
-                        delta=f"Лимит: ≤ {limit_lost_profit}%",
-                        delta_color="normal" if result['lost_profit_ok'] else "inverse"
-                    )
-                    st.caption(f"Недопроданных штук: {result['total_lost_qty']:,.0f} из {result['total_sales_qty'] + result['total_lost_qty']:,.0f}")
-                with col2:
-                    st.metric(
-                        label="Неликвид (доля в остатке)",
-                        value=f"{result['dead_stock_pct']:.2f}%",
-                        delta=f"Лимит: ≤ {limit_dead_stock}%",
-                        delta_color="normal" if result['dead_stock_ok'] else "inverse"
-                    )
-                    st.caption(f"Товаров без продаж за 2 месяца: {result['dead_items_count']}")
+                    # --- Общий итог по премии ---
+                    st.header("💰 Итоговая премия")
+                    if result['bonus'] > 0:
+                        st.success(f"**{result['bonus']:,} руб.**")
+                    else:
+                        st.error(f"**{result['bonus']} руб.**")
+                    st.caption(result['bonus_detail'])
 
-                # --- Детали ---
-                with st.expander("📋 Детальный расчёт"):
-                    st.write(f"**Оборачиваемость (за {month_names[month2_num]}, {days_in_month2} дней)**")
-                    st.write(f"- Остаток на начало месяца (конец первого месяца): {result['opening_stock']:,.0f} руб.")
-                    st.write(f"- Остаток на конец месяца: {result['closing_stock']:,.0f} руб.")
-                    st.write(f"- Средний остаток: {result['avg_stock']:,.0f} руб.")
-                    st.write(f"- Себестоимость продаж за месяц: {result['cost_sales_month2']:,.0f} руб.")
-                    st.write(f"- Оборачиваемость: {result['turnover']:.2f} дней")
+                    # --- KPI ---
+                    st.subheader("🎯 Драйверные KPI")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric(
+                            label="In‑Stock Retail",
+                            value=f"{result['in_stock_pct']:.1f}%",
+                            delta=f"Цель: {target_in_stock}%",
+                            delta_color="normal" if result['in_stock_ok'] else "inverse"
+                        )
+                        st.caption(f"Городов с наличием: {result['cities_with_stock']} из {result['total_cities']}")
+                    with col2:
+                        st.metric(
+                            label="Оборачиваемость (дни)",
+                            value=f"{result['turnover_days']:.1f}" if result['turnover_days'] != float('inf') else "∞",
+                            delta=f"Цель: ≤ {target_turnover}",
+                            delta_color="normal" if result['turnover_ok'] else "inverse"
+                        )
+                        st.caption(f"Среднедневные продажи (шт): {result['avg_daily_sales']:.1f}")
 
-                    st.write("**Неликвид**")
-                    st.write(f"- Остаток неликвидов по себестоимости: {result['dead_stock_cost']:,.0f} руб.")
-                    st.write(f"- Общий остаток: {result['total_stock_cost']:,.0f} руб.")
-                    st.write(f"- Доля неликвида: {result['dead_stock_pct']:.2f}%")
+                    # --- Стоп-факторы ---
+                    st.subheader("⛔ Стоп-факторы (обнуляют премию)")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric(
+                            label="Упущенная прибыль (доля недопроданных штук)",
+                            value=f"{result['lost_profit_pct']:.2f}%",
+                            delta=f"Лимит: ≤ {limit_lost_profit}%",
+                            delta_color="normal" if result['lost_profit_ok'] else "inverse"
+                        )
+                        st.caption(f"Недопроданных штук: {result['total_lost_qty']:,.0f} из {result['total_sales_qty'] + result['total_lost_qty']:,.0f}")
+                    with col2:
+                        st.metric(
+                            label="Неликвид (доля в остатке, шт)",
+                            value=f"{result['dead_stock_pct']:.2f}%",
+                            delta=f"Лимит: ≤ {limit_dead_stock}%",
+                            delta_color="normal" if result['dead_stock_ok'] else "inverse"
+                        )
+                        st.caption(f"Товаров без продаж за 2 месяца: {result['dead_items_count']}")
+
+                    # --- Детали ---
+                    with st.expander("📋 Детальный расчёт"):
+                        st.write("**Оборачиваемость (в штуках)**")
+                        st.write(f"- Остаток на начало месяца (шт): {result['opening_stock_qty']:,.0f}")
+                        st.write(f"- Остаток на конец месяца (шт): {result['closing_stock_qty']:,.0f}")
+                        st.write(f"- Средний остаток (шт): {result['avg_stock_qty']:,.0f}")
+                        st.write(f"- Среднедневные продажи (шт): {result['avg_daily_sales']:.2f}")
+                        st.write(f"- Оборачиваемость (дни): {result['turnover_days']:.2f}")
+
+                        st.write("**Неликвид**")
+                        st.write(f"- Остаток неликвидов (шт): {result['dead_stock_qty']:,.0f}")
+                        st.write(f"- Общий остаток (шт): {result['total_stock_qty']:,.0f}")
+                        st.write(f"- Доля неликвида: {result['dead_stock_pct']:.2f}%")
+
+                with tab2:
+                    st.subheader("🔍 Детальная оборачиваемость по товарам и городам")
+                    st.caption("Показаны только позиции, у которых оборачиваемость превышает целевой норматив.")
+
+                    # Фильтруем только превышающие
+                    over_df = detailed_turnover[detailed_turnover['Превышение'] == True].copy()
+
+                    if over_df.empty:
+                        st.info("✅ Все товары укладываются в норматив оборачиваемости. Отличная работа!")
+                    else:
+                        # Форматируем числа
+                        over_df['Оборачиваемость_дни'] = over_df['Оборачиваемость_дни'].apply(lambda x: f"{x:.1f}" if x != float('inf') else "∞")
+                        over_df['Среднедневные_продажи_шт'] = over_df['Среднедневные_продажи_шт'].round(2)
+                        # Сортируем по убыванию оборачиваемости
+                        over_df = over_df.sort_values('Оборачиваемость_дни', ascending=False, key=lambda x: x.replace('∞', '9999').astype(float))
+
+                        # Выводим таблицу
+                        st.dataframe(
+                            over_df[['Номенклатура', 'Характеристика', 'Город',
+                                     'Остаток_на_начало_месяца_шт', 'Остаток_на_конец_месяца_шт',
+                                     'Среднедневные_продажи_шт', 'Оборачиваемость_дни']],
+                            use_container_width=True,
+                            column_config={
+                                "Оборачиваемость_дни": st.column_config.TextColumn("Оборачиваемость (дни)"),
+                            }
+                        )
+
+                        # Дополнительная статистика
+                        st.caption(f"Всего проблемных позиций: {len(over_df)}")
+                        # Можно добавить экспорт в CSV
+                        csv = over_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="📥 Скачать отчёт по оборачиваемости (CSV)",
+                            data=csv,
+                            file_name=f"detected_turnover_issues_{month_names[month2_num]}.csv",
+                            mime="text/csv",
+                        )
 
             except Exception as e:
                 st.error(f"Ошибка при обработке: {e}")
