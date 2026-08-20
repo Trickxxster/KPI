@@ -482,56 +482,7 @@ def compute_detailed_turnover(df_month1, df_month2, days_in_month2, target_turno
 
 
 # ------------------------------------------------------------
-# 8. Функция для отображения метрик с работающей всплывающей подсказкой (исправлена)
-# ------------------------------------------------------------
-def metric_with_tooltip(label, value, delta, tooltip, delta_color="normal"):
-    """
-    Отображает метрику с всплывающей подсказкой (tooltip) при наведении на значок ⓘ.
-    """
-    html = f"""
-    <div style="margin-bottom: 0.25rem; display: flex; align-items: center; gap: 5px;">
-        <span style="font-weight: bold; font-size: 1rem;">{label}</span>
-        <span class="custom-tooltip" style="cursor: help; border-bottom: 1px dotted #aaa; position: relative; display: inline-block;">
-            ⓘ
-            <span class="tooltiptext" style="
-                visibility: hidden;
-                width: 300px;
-                background-color: #333;
-                color: #fff;
-                text-align: left;
-                border-radius: 6px;
-                padding: 8px 12px;
-                position: absolute;
-                z-index: 1000;
-                bottom: 150%;
-                left: 50%;
-                transform: translateX(-50%);
-                opacity: 0;
-                transition: opacity 0.3s;
-                font-weight: normal;
-                font-size: 0.85rem;
-                box-shadow: 0 2px 10px rgba(0,0,0,0.4);
-                white-space: normal;
-                word-wrap: break-word;
-                line-height: 1.4;
-            ">
-                {tooltip}
-            </span>
-        </span>
-    </div>
-    <style>
-        .custom-tooltip:hover .tooltiptext {{
-            visibility: visible;
-            opacity: 1;
-        }}
-    </style>
-    """
-    st.markdown(html, unsafe_allow_html=True)
-    st.metric(label="", value=value, delta=delta, delta_color=delta_color)
-
-
-# ------------------------------------------------------------
-# 9. Интерфейс Streamlit (обновлён)
+# 8. Интерфейс Streamlit (с использованием стандартных help-подсказок)
 # ------------------------------------------------------------
 st.set_page_config(page_title="KPI Категорийного менеджера", layout="wide")
 st.title("📊 Оценка эффективности категорийного менеджера")
@@ -607,7 +558,6 @@ if st.button("🚀 Рассчитать KPI"):
                 if df_m2.empty:
                     st.error("Второй файл не содержит данных или имеет неверную структуру.")
                     st.stop()
-                # Проверяем, что есть хотя бы одна строка с номенклатурой (не пустая)
                 if df_m1['Номенклатура'].isna().all() or (df_m1['Номенклатура'].str.strip() == '').all():
                     st.error("В первом файле не найдено ни одного товара (столбец 'Номенклатура' пуст).")
                     st.stop()
@@ -668,22 +618,22 @@ if st.button("🚀 Рассчитать KPI"):
                     st.subheader("🎯 Драйверные KPI")
                     col_a, col_b = st.columns(2)
                     with col_a:
-                        metric_with_tooltip(
+                        st.metric(
                             label="In‑Stock Retail",
                             value=f"{result['in_stock_pct']:.1f}%",
                             delta=f"Цель: {target_in_stock}%",
-                            tooltip="Доля товаров, которые продавались в городе за последние 2 месяца и есть в наличии на конец отчётного месяца. Рассчитывается как среднее по городам.\n\nФормула: (количество продаваемых товаров в наличии / общее количество продаваемых товаров в городе) × 100%",
-                            delta_color="normal" if result['in_stock_ok'] else "inverse"
+                            delta_color="normal" if result['in_stock_ok'] else "inverse",
+                            help="Доля товаров, которые продавались в городе за последние 2 месяца и есть в наличии на конец отчётного месяца. Рассчитывается как среднее по городам.\n\nФормула: (количество продаваемых товаров в наличии / общее количество продаваемых товаров в городе) × 100%"
                         )
                         progress_in = min(result['in_stock_pct'] / target_in_stock, 1.0) if target_in_stock > 0 else 0
                         st.progress(progress_in, text=f"{result['in_stock_pct']:.1f}% от цели")
                     with col_b:
-                        metric_with_tooltip(
+                        st.metric(
                             label="Оборачиваемость (дни)",
                             value=f"{result['turnover_days']:.1f}" if result['turnover_days'] != float('inf') else "∞",
                             delta=f"Цель: ≤ {target_turnover}",
-                            tooltip="Средний срок хранения запаса в днях по всей сети.\n\nФормула: (средний остаток за месяц в штуках) / (среднедневные продажи в штуках)",
-                            delta_color="normal" if result['turnover_ok'] else "inverse"
+                            delta_color="normal" if result['turnover_ok'] else "inverse",
+                            help="Средний срок хранения запаса в днях по всей сети.\n\nФормула: (средний остаток за месяц в штуках) / (среднедневные продажи в штуках)"
                         )
                         if result['turnover_days'] != float('inf'):
                             progress_turn = max(0, min(1 - (result['turnover_days'] / (target_turnover * 2)), 1))
@@ -695,24 +645,24 @@ if st.button("🚀 Рассчитать KPI"):
                     st.subheader("⛔ Стоп-факторы (обнуляют премию)")
                     col1, col2 = st.columns(2)
                     with col1:
-                        metric_with_tooltip(
+                        st.metric(
                             label="Упущенная прибыль",
                             value=f"{result['lost_profit_pct']:.2f}%",
                             delta=f"Лимит: ≤ {limit_lost_profit}%",
-                            tooltip="Доля недопроданных штук от общего спроса. Считается, что если остаток = 0, то весь потенциальный спрос за месяц был упущен. Учитываются только товары, которые продавались (среднедневные продажи > 0).\n\nФормула: (недопроданные штуки / (проданные штуки + недопроданные штуки)) × 100%",
-                            delta_color="normal" if result['lost_profit_ok'] else "inverse"
+                            delta_color="normal" if result['lost_profit_ok'] else "inverse",
+                            help="Доля недопроданных штук от общего спроса. Считается, что если остаток = 0, то весь потенциальный спрос за месяц был упущен. Учитываются только товары, которые продавались (среднедневные продажи > 0).\n\nФормула: (недопроданные штуки / (проданные штуки + недопроданные штуки)) × 100%"
                         )
                         st.caption(f"Недопроданных штук: {result['total_lost_qty']:,.0f} из {result['total_sales_qty'] + result['total_lost_qty']:,.0f}")
                         if result['price_dict_used']:
                             st.caption(f"Упущенная выручка: {result['lost_profit_revenue']:,.0f} руб." if result['lost_profit_revenue'] else "—")
                             st.caption(f"Упущенная маржа: {result['lost_profit_margin']:,.0f} руб." if result['lost_profit_margin'] else "—")
                     with col2:
-                        metric_with_tooltip(
+                        st.metric(
                             label="Неликвид",
                             value=f"{result['dead_stock_pct']:.2f}%",
                             delta=f"Лимит: ≤ {limit_dead_stock}%",
-                            tooltip="Доля остатка (в штуках) товаров, которые не продавались ни в предыдущем, ни в отчётном месяце.\n\nФормула: (остаток неликвидов в штуках / общий остаток в штуках) × 100%",
-                            delta_color="normal" if result['dead_stock_ok'] else "inverse"
+                            delta_color="normal" if result['dead_stock_ok'] else "inverse",
+                            help="Доля остатка (в штуках) товаров, которые не продавались ни в предыдущем, ни в отчётном месяце.\n\nФормула: (остаток неликвидов в штуках / общий остаток в штуках) × 100%"
                         )
                         st.caption(f"Товаров без продаж за 2 месяца: {result['dead_items_count']}")
 
@@ -794,7 +744,6 @@ if st.button("🚀 Рассчитать KPI"):
                         # 1. Дефицит: остаток = 0 и Ср_продажа > 0
                         deficit_df = df_m2[(df_m2['Остаток'] == 0) & (df_m2['Ср_продажа'] > min_avg_sales)].copy()
                         if not deficit_df.empty:
-                            # Рассчитываем недопроданное количество и сумму в РРЦ
                             deficit_df['Недопроданное'] = deficit_df['Ср_продажа'] * days_in_month2
                             if 'РРЦ' in deficit_df.columns:
                                 deficit_df['Сумма в РРЦ'] = deficit_df['Недопроданное'] * deficit_df['РРЦ']
