@@ -443,13 +443,12 @@ def calculate_kpi(df_month1, df_month2,
         'lost_profit_margin': lost_profit_margin,
         'price_dict_used': price_dict is not None and use_prices
     }
-    # Сохраняем dead_keys для последующего использования в таблицах
     result['dead_keys'] = dead_keys
     return result
 
 
 # ------------------------------------------------------------
-# 7. Детальный расчёт оборачиваемости по товарам и городам
+# 7. Детальный расчёт оборачиваемости по товарам и городам (исправлено)
 # ------------------------------------------------------------
 def compute_detailed_turnover(df_month1, df_month2, days_in_month2, target_turnover):
     merged = pd.merge(
@@ -465,6 +464,13 @@ def compute_detailed_turnover(df_month1, df_month2, days_in_month2, target_turno
         lambda row: row['Средний_остаток'] / row['Ср_продажа'] if row['Ср_продажа'] > 0 else float('inf'),
         axis=1
     )
+    # Исключаем строки, где нет ни остатка, ни продаж (все нули)
+    merged = merged[
+        (merged['Остаток_нач'] > 0) | 
+        (merged['Остаток_кон'] > 0) | 
+        (merged['Ср_продажа'] > 0) |
+        (merged['Количество'] > 0)
+    ]
     merged['Превышение'] = merged['Оборачиваемость_дни'] > target_turnover
     merged.rename(columns={
         'Остаток_нач': 'Остаток_на_начало_месяца_шт',
@@ -668,7 +674,7 @@ if st.button("🚀 Рассчитать KPI"):
 
                 with tab2:
                     st.subheader("🔍 Детальная оборачиваемость по товарам и городам")
-                    st.caption("Показаны только позиции, у которых оборачиваемость превышает целевой норматив.")
+                    st.caption("Показаны только позиции, у которых оборачиваемость превышает целевой норматив и есть остаток или продажи.")
 
                     over_df = detailed_turnover[detailed_turnover['Превышение'] == True].copy()
 
