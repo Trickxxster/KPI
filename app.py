@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from calendar import monthrange
+from rapidfuzz import process, fuzz
+import io
 
 # ------------------------------------------------------------
 # 1. Парсер Excel-файла (без изменений)
@@ -107,34 +109,132 @@ def parse_excel(file):
 
 
 # ------------------------------------------------------------
-# 2. Расчёт In‑Stock Retail по городам с учётом продаваемых товаров
+# 2. Нормализация строк для сопоставления
+# ------------------------------------------------------------
+def normalize_text(text):
+    """Приводит строку к единому формату: нижний регистр, удаление лишних пробелов."""
+    if pd.isna(text):
+        return ''
+    return str(text).lower().strip()
+
+
+# ------------------------------------------------------------
+# 3. Загрузка прайс-листа
+# ------------------------------------------------------------
+def load_prices(file):
+    """
+    Загружает файл с ценами (Excel или CSV).
+    Ожидает колонки: 'Номенклатура', 'Характеристика', 'Закупочная_цена', 'РРЦ'.
+    Если названия колонок отличаются, пытается угадать.
+    """
+    if file.name.endswith('.csv'):
+        df = pd.read_csv(file)
+    else:
+        df = pd.read_excel(file)
+    
+    # Попытка найти нужные колонки
+    col_map = {}
+    for col in df.columns:
+        col_lower = col.lower().strip()
+        if 'номенклатур' in col_lower or 'название' in col_lower or 'товар' in col_lower:
+            col_map['Номенклатура'] = col
+        elif 'характеристик' in col_lower or 'модель' in col_lower or 'артикул' in col_lower:
+            col_map['Характеристика'] = col
+        elif 'закуп' in col_lower or 'себестоим' in col_lower:
+            col_map['Закупочная_цена'] = col
+        elif 'ррц' in col_lower or 'розничн' in col_lower or 'цена' in col_lower:
+            col_map['РРЦ'] = col
+    
+    # Если не нашли все, используем первые колонки (предполагаем, что структура: Номенклатура, Характеристика, Закупка, РРЦ)
+    if len(col_map) < 4:
+        if len(df.columns) >= 4:
+            col_map = {
+                'Номенклатура': df.columns[0],
+                'Характеристика': df.columns[1],
+                'Закупочная_цена': df.columns[2],
+                'РРЦ': df.columns[3]
+            }
+        else:
+            st.error("Не удалось определить колонки в файле цен. Ожидаются: Номенклатура, Характеристика, Закупочная_цена, РРЦ")
+            return pd.DataFrame()
+    
+    # Переименовываем
+    df_renamed = df.rename(columns=col_map)
+    # Оставляем только нужные колонки
+    df_renamed = df_renamed[['Номенклатура', 'Характеристика', 'Закупочная_цена', 'РРЦ']]
+    # Приводим к числам
+    for col in ['Закупочная_цена', 'РРЦ']:
+        df_renamed[col] = pd.to_numeric(df_renamed[col], errors='coerce')
+    # Удаляем строки без цен
+    df_renamed = df_renamed.dropna(subset=['Закупочная_цена', 'РРЦ'], how='all')
+    return df_renamed
+
+
+# ------------------------------------------------------------
+# 4. Сопоставление товаров с прайс-листом (нечёткое)
+# ------------------------------------------------------------
+def match_prices(df_products, df_prices, threshold=80):
+    """
+    Для каждого уникального товара (номенклатура + характеристика) из df_products
+    ищет наиболее похожее название в df_prices.
+    Возвращает словарь { (номенклатура, характеристика): (закупочная_цена, ррц) }
+    """
+    if df_prices.empty:
+        return {}
+    
+    # Создаём список ключей для поиска из прайса (объединяем номенклатуру и характеристику)
+    price_keys = []
+    price_indices = []
+    for idx, row in df_prices.iterrows():
+        key = normalize_text(row['Номенклатура']) + ' ' + normalize_text(row.get('Характеристика', ''))
+        price_keys.append(key)
+        price_indices.append(idx)
+    
+    # Уникальные товары из выгрузки
+    unique_products = df_products[['Номенклатура', 'Характеристика']].drop_duplicates()
+    match_dict = {}
+    
+    for _, prod_row in unique_products.iterrows():
+        search_key = normalize_text(prod_row['Номенклатура']) + ' ' + normalize_text(prod_row.get('Характеристика', ''))
+        if search_key.strip() == '':
+            continue
+        # Ищем лучшее совпадение
+        best_match, score, idx = process.extractOne(search_key, price_keys, scorer=fuzz.token_sort_ratio)
+        if score >= threshold:
+            matched_row = df_prices.iloc[price_indices[idx]]
+            match_dict[(prod_row['Номенклатура'], prod_row['Характеристика'])] = (
+                matched_row['Закупочная_цена'],
+                matched_row['РРЦ']
+            )
+        # иначе пропускаем (цена не найдена)
+    
+    return match_dict
+
+
+# ------------------------------------------------------------
+# 5. Расчёт In‑Stock Retail по городам (возвращает словарь)
 # ------------------------------------------------------------
 def calculate_in_stock_retail_by_city_sales(df_month1, df_month2, min_avg_sales=0.01):
     """
-    Рассчитывает In-Stock Retail как среднюю долю наличия товаров,
-    которые продавались в каждом городе (среднедневные продажи > min_avg_sales за 2 месяца).
+    Рассчитывает In-Stock Retail для каждого города отдельно.
+    Возвращает словарь {город: доля_наличия_в_%}
     """
-    # Объединяем данные за два месяца
     df_combined = pd.concat([df_month1, df_month2], ignore_index=True)
     
-    # Для каждого города и товара считаем сумму среднедневных продаж за 2 месяца
+    # Суммарные среднедневные продажи за два месяца по каждому товару в городе
     sales_by_city_sku = df_combined.groupby(['Город', 'Номенклатура', 'Характеристика'])['Ср_продажа'].sum().reset_index()
-    # Товар считается продаваемым, если суммарная средняя > порога
     sales_by_city_sku['Продаваемый'] = sales_by_city_sku['Ср_продажа'] > min_avg_sales
     
     cities = df_month2['Город'].unique()
-    city_shares = []
+    city_shares = {}
     
     for city in cities:
-        # Все товары, которые продавались в этом городе
         selling_items = sales_by_city_sku[(sales_by_city_sku['Город'] == city) & (sales_by_city_sku['Продаваемый'] == True)]
         total_selling = len(selling_items)
-        
         if total_selling == 0:
-            # Если в городе ничего не продавалось за 2 месяца, исключаем его из расчёта
+            city_shares[city] = None  # нет продаж – исключаем
             continue
         
-        # Считаем, сколько из этих товаров есть в наличии на конец отчётного месяца
         city_data = df_month2[df_month2['Город'] == city]
         present = 0
         for _, row in selling_items.iterrows():
@@ -142,16 +242,13 @@ def calculate_in_stock_retail_by_city_sales(df_month1, df_month2, min_avg_sales=
                 (city_data['Характеристика'] == row['Характеристика']) & 
                 (city_data['Остаток'] > 0)).any():
                 present += 1
-        
-        share = (present / total_selling) * 100
-        city_shares.append(share)
+        city_shares[city] = (present / total_selling) * 100 if total_selling > 0 else None
     
-    avg_share = np.mean(city_shares) if city_shares else 0
-    return avg_share
+    return city_shares
 
 
 # ------------------------------------------------------------
-# 3. Расчёт KPI (всё в штуках)
+# 6. Основной расчёт KPI (с учётом цен и детализации по городам)
 # ------------------------------------------------------------
 def calculate_kpi(df_month1, df_month2,
                   days_in_month2,
@@ -159,17 +256,20 @@ def calculate_kpi(df_month1, df_month2,
                   target_turnover=35,
                   limit_lost_profit=5,
                   limit_dead_stock=10,
-                  min_avg_sales=0.01):
+                  min_avg_sales=0.01,
+                  price_dict=None,
+                  use_prices=False):
     """
-    df_month1 – данные за первый месяц (предыдущий)
-    df_month2 – данные за второй месяц (отчётный)
-    days_in_month2 – количество дней во втором месяце
+    Рассчитывает KPI и возвращает словарь с результатами, включая per-city метрики.
     """
-    # --- In-Stock Retail (новый расчёт) ---
-    in_stock_pct = calculate_in_stock_retail_by_city_sales(df_month1, df_month2, min_avg_sales)
+    # --- In-Stock Retail (средний по городам) ---
+    city_in_stock = calculate_in_stock_retail_by_city_sales(df_month1, df_month2, min_avg_sales)
+    # Усредняем только по городам, где есть продажи
+    in_stock_values = [v for v in city_in_stock.values() if v is not None]
+    in_stock_pct = np.mean(in_stock_values) if in_stock_values else 0
     in_stock_ok = in_stock_pct >= target_in_stock
 
-    # --- Оборачиваемость (в штуках) ---
+    # --- Оборачиваемость (в штуках) по всей сети ---
     opening_stock_qty = df_month1['Остаток'].sum()
     closing_stock_qty = df_month2['Остаток'].sum()
     avg_stock_qty = (opening_stock_qty + closing_stock_qty) / 2
@@ -180,9 +280,11 @@ def calculate_kpi(df_month1, df_month2,
         turnover_days = float('inf')
     turnover_ok = turnover_days <= target_turnover
 
-    # --- Упущенная прибыль (в штуках) ---
+    # --- Упущенная прибыль (только по продаваемым товарам, Ср_продажа > 0) ---
     df_month2['Недопроданное'] = df_month2.apply(
-        lambda row: row['Ср_продажа'] * days_in_month2 if row['Остаток'] == 0 else 0,
+        lambda row: row['Ср_продажа'] * days_in_month2 
+                     if (row['Остаток'] == 0 and row['Ср_продажа'] > min_avg_sales) 
+                     else 0,
         axis=1
     )
     total_lost_qty = df_month2['Недопроданное'].sum()
@@ -190,6 +292,27 @@ def calculate_kpi(df_month1, df_month2,
     total_demand = total_sales_qty + total_lost_qty
     lost_profit_pct = (total_lost_qty / total_demand * 100) if total_demand > 0 else 0
     lost_profit_ok = lost_profit_pct <= limit_lost_profit
+
+    # Если есть цены и включено их использование, считаем в деньгах
+    lost_profit_revenue = None
+    lost_profit_margin = None
+    if use_prices and price_dict:
+        # Присоединяем цены к df_month2
+        df_month2['Закупочная_цена'] = df_month2.apply(
+            lambda row: price_dict.get((row['Номенклатура'], row['Характеристика']), (None, None))[0],
+            axis=1
+        )
+        df_month2['РРЦ'] = df_month2.apply(
+            lambda row: price_dict.get((row['Номенклатура'], row['Характеристика']), (None, None))[1],
+            axis=1
+        )
+        # Для строк с недопроданным > 0 считаем потери
+        lost_rows = df_month2[df_month2['Недопроданное'] > 0]
+        if not lost_rows.empty:
+            lost_revenue = (lost_rows['Недопроданное'] * lost_rows['РРЦ']).sum()
+            lost_margin = (lost_rows['Недопроданное'] * (lost_rows['РРЦ'] - lost_rows['Закупочная_цена'])).sum()
+            lost_profit_revenue = lost_revenue
+            lost_profit_margin = lost_margin
 
     # --- Неликвид (в штуках) ---
     sales_m1 = df_month1.groupby(['Номенклатура', 'Характеристика'])['Количество'].sum().reset_index()
@@ -224,6 +347,56 @@ def calculate_kpi(df_month1, df_month2,
             bonus = 0
             bonus_detail = "0 руб. (не выполнены оба KPI)"
 
+    # --- Детализация по городам ---
+    city_metrics = {}
+    cities = df_month2['Город'].unique()
+    for city in cities:
+        city_df = df_month2[df_month2['Город'] == city]
+        city_df1 = df_month1[df_month1['Город'] == city]
+        
+        # Оборачиваемость по городу
+        open_stock = city_df1['Остаток'].sum()
+        close_stock = city_df['Остаток'].sum()
+        avg_stock = (open_stock + close_stock) / 2
+        avg_sales = city_df['Ср_продажа'].sum()
+        if avg_sales > 0:
+            turnover_city = avg_stock / avg_sales
+        else:
+            turnover_city = float('inf')
+        
+        # In-Stock по городу (берём из ранее рассчитанного)
+        in_stock_city = city_in_stock.get(city, None)
+        
+        # Упущенная прибыль по городу
+        city_lost = city_df.apply(
+            lambda row: row['Ср_продажа'] * days_in_month2 
+                         if (row['Остаток'] == 0 and row['Ср_продажа'] > min_avg_sales) 
+                         else 0,
+            axis=1
+        ).sum()
+        city_sales = city_df['Количество'].sum()
+        city_demand = city_sales + city_lost
+        lost_pct_city = (city_lost / city_demand * 100) if city_demand > 0 else 0
+        
+        # Неликвид по городу (используем те же dead_keys)
+        dead_city = 0
+        for _, row in city_df.iterrows():
+            if (row['Номенклатура'], row['Характеристика']) in dead_keys:
+                dead_city += row['Остаток']
+        total_stock_city = city_df['Остаток'].sum()
+        dead_pct_city = (dead_city / total_stock_city * 100) if total_stock_city > 0 else 0
+        
+        city_metrics[city] = {
+            'in_stock_pct': in_stock_city,
+            'turnover_days': turnover_city,
+            'lost_profit_pct': lost_pct_city,
+            'lost_profit_qty': city_lost,
+            'dead_stock_pct': dead_pct_city,
+            'dead_stock_qty': dead_city,
+            'total_sales': city_sales,
+            'total_stock': total_stock_city
+        }
+
     result = {
         'in_stock_pct': in_stock_pct,
         'in_stock_ok': in_stock_ok,
@@ -245,13 +418,17 @@ def calculate_kpi(df_month1, df_month2,
         'dead_stock_qty': dead_stock_qty,
         'total_stock_qty': total_stock_qty,
         'dead_items_count': len(dead_keys),
-        'days_in_month2': days_in_month2
+        'days_in_month2': days_in_month2,
+        'city_metrics': city_metrics,
+        'lost_profit_revenue': lost_profit_revenue,
+        'lost_profit_margin': lost_profit_margin,
+        'price_dict_used': price_dict is not None and use_prices
     }
     return result
 
 
 # ------------------------------------------------------------
-# 4. Детальный расчёт оборачиваемости по товарам и городам
+# 7. Детальный расчёт оборачиваемости по товарам и городам (без изменений)
 # ------------------------------------------------------------
 def compute_detailed_turnover(df_month1, df_month2, days_in_month2, target_turnover):
     merged = pd.merge(
@@ -279,7 +456,7 @@ def compute_detailed_turnover(df_month1, df_month2, days_in_month2, target_turno
 
 
 # ------------------------------------------------------------
-# 5. Интерфейс Streamlit
+# 8. Интерфейс Streamlit
 # ------------------------------------------------------------
 st.set_page_config(page_title="KPI Категорийного менеджера", layout="wide")
 st.title("📊 Оценка эффективности категорийного менеджера")
@@ -301,6 +478,15 @@ min_avg_sales = st.sidebar.number_input(
     "Минимальный порог среднедневных продаж (для определения продаваемого товара)",
     min_value=0.0, value=0.01, step=0.01, format="%.3f"
 )
+
+# Загрузка прайс-листа
+st.sidebar.markdown("---")
+st.sidebar.subheader("💰 Цены для расчёта упущенной прибыли")
+use_prices = st.sidebar.checkbox("Использовать цены (Excel/CSV)", value=False)
+price_file = None
+if use_prices:
+    price_file = st.sidebar.file_uploader("Загрузите файл с ценами", type=["xlsx", "csv"])
+    st.sidebar.caption("Ожидаются колонки: Номенклатура, Характеристика, Закупочная_цена, РРЦ")
 
 st.markdown("---")
 st.write("Загрузите два Excel-файла: **первый** (предыдущий месяц) и **второй** (отчётный месяц).")
@@ -336,17 +522,30 @@ if st.button("🚀 Рассчитать KPI"):
                     st.error("Не удалось распознать структуру файлов. Проверьте формат.")
                     st.stop()
 
+                # Загрузка прайса, если включено
+                price_dict = None
+                if use_prices and price_file is not None:
+                    df_prices = load_prices(price_file)
+                    if not df_prices.empty:
+                        price_dict = match_prices(df_m2, df_prices, threshold=80)
+                        if not price_dict:
+                            st.warning("Не удалось сопоставить ни одного товара с прайс-листом. Проверьте названия.")
+                    else:
+                        st.warning("Файл с ценами не загружен или имеет неверный формат.")
+
                 # Основной расчёт
                 result = calculate_kpi(df_m1, df_m2, days_in_month2,
                                        target_in_stock, target_turnover,
                                        limit_lost_profit, limit_dead_stock,
-                                       min_avg_sales)
+                                       min_avg_sales,
+                                       price_dict=price_dict,
+                                       use_prices=use_prices and price_dict is not None)
 
                 # Детальная оборачиваемость
                 detailed_turnover = compute_detailed_turnover(df_m1, df_m2, days_in_month2, target_turnover)
 
                 # Создаём вкладки
-                tab1, tab2 = st.tabs(["📈 Основные KPI", "🔍 Детали оборачиваемости"])
+                tab1, tab2, tab3 = st.tabs(["📈 Основные KPI", "🔍 Детали оборачиваемости", "🏙️ Аналитика по городам"])
 
                 with tab1:
                     st.success("✅ Расчёт выполнен!")
@@ -359,25 +558,31 @@ if st.button("🚀 Рассчитать KPI"):
                         st.error(f"**{result['bonus']} руб.**")
                     st.caption(result['bonus_detail'])
 
-                    # --- KPI ---
-                    st.subheader("🎯 Драйверные KPI")
-                    col1, col2 = st.columns(2)
-                    with col1:
+                    # Визуализация выполнения целей (прогресс-бары)
+                    col_a, col_b = st.columns(2)
+                    with col_a:
                         st.metric(
                             label="In‑Stock Retail",
                             value=f"{result['in_stock_pct']:.1f}%",
                             delta=f"Цель: {target_in_stock}%",
-                            delta_color="normal" if result['in_stock_ok'] else "inverse",
-                            help="Доля товаров, которые продаются в каждом городе (среднедневные продажи за 2 месяца > порога) и есть в наличии на конец месяца. Среднее по городам."
+                            delta_color="normal" if result['in_stock_ok'] else "inverse"
                         )
-                    with col2:
+                        # Прогресс-бар
+                        progress_in = min(result['in_stock_pct'] / target_in_stock, 1.0) if target_in_stock > 0 else 0
+                        st.progress(progress_in, text=f"{result['in_stock_pct']:.1f}% от цели")
+                    with col_b:
                         st.metric(
                             label="Оборачиваемость (дни)",
                             value=f"{result['turnover_days']:.1f}" if result['turnover_days'] != float('inf') else "∞",
                             delta=f"Цель: ≤ {target_turnover}",
-                            delta_color="normal" if result['turnover_ok'] else "inverse",
-                            help="Средний срок хранения запаса в днях. Рассчитывается как средний остаток (шт) / среднедневные продажи (шт) по всей сети."
+                            delta_color="normal" if result['turnover_ok'] else "inverse"
                         )
+                        # Прогресс-бар (обратный: чем меньше, тем лучше)
+                        if result['turnover_days'] != float('inf'):
+                            progress_turn = max(0, min(1 - (result['turnover_days'] / (target_turnover * 2)), 1))
+                            st.progress(progress_turn, text=f"{result['turnover_days']:.1f} дн. (норма ≤ {target_turnover})")
+                        else:
+                            st.progress(0, text="Нет продаж")
 
                     # --- Стоп-факторы ---
                     st.subheader("⛔ Стоп-факторы (обнуляют премию)")
@@ -387,33 +592,33 @@ if st.button("🚀 Рассчитать KPI"):
                             label="Упущенная прибыль",
                             value=f"{result['lost_profit_pct']:.2f}%",
                             delta=f"Лимит: ≤ {limit_lost_profit}%",
-                            delta_color="normal" if result['lost_profit_ok'] else "inverse",
-                            help="Доля недопроданных штук от общего спроса. Считается, что если остаток = 0, то весь потенциальный спрос за месяц был упущен."
+                            delta_color="normal" if result['lost_profit_ok'] else "inverse"
                         )
                         st.caption(f"Недопроданных штук: {result['total_lost_qty']:,.0f} из {result['total_sales_qty'] + result['total_lost_qty']:,.0f}")
+                        if result['price_dict_used']:
+                            st.caption(f"Упущенная выручка: {result['lost_profit_revenue']:,.0f} руб." if result['lost_profit_revenue'] else "—")
+                            st.caption(f"Упущенная маржа: {result['lost_profit_margin']:,.0f} руб." if result['lost_profit_margin'] else "—")
                     with col2:
                         st.metric(
                             label="Неликвид",
                             value=f"{result['dead_stock_pct']:.2f}%",
                             delta=f"Лимит: ≤ {limit_dead_stock}%",
-                            delta_color="normal" if result['dead_stock_ok'] else "inverse",
-                            help="Доля остатка (в штуках) товаров, которые не продавались ни в предыдущем, ни в отчётном месяце."
+                            delta_color="normal" if result['dead_stock_ok'] else "inverse"
                         )
                         st.caption(f"Товаров без продаж за 2 месяца: {result['dead_items_count']}")
 
-                    # --- Детали ---
-                    with st.expander("📋 Детальный расчёт"):
-                        st.write("**Оборачиваемость (в штуках)**")
-                        st.write(f"- Остаток на начало месяца (шт): {result['opening_stock_qty']:,.0f}")
-                        st.write(f"- Остаток на конец месяца (шт): {result['closing_stock_qty']:,.0f}")
-                        st.write(f"- Средний остаток (шт): {result['avg_stock_qty']:,.0f}")
-                        st.write(f"- Среднедневные продажи (шт): {result['avg_daily_sales']:.2f}")
-                        st.write(f"- Оборачиваемость (дни): {result['turnover_days']:.2f}")
-
-                        st.write("**Неликвид**")
-                        st.write(f"- Остаток неликвидов (шт): {result['dead_stock_qty']:,.0f}")
-                        st.write(f"- Общий остаток (шт): {result['total_stock_qty']:,.0f}")
-                        st.write(f"- Доля неликвида: {result['dead_stock_pct']:.2f}%")
+                    # Круговая диаграмма для структуры запасов (неликвид vs остальное)
+                    if result['total_stock_qty'] > 0:
+                        import matplotlib.pyplot as plt
+                        fig, ax = plt.subplots(figsize=(4, 4))
+                        sizes = [result['dead_stock_qty'], result['total_stock_qty'] - result['dead_stock_qty']]
+                        labels = ['Неликвид', 'Оборотный запас']
+                        colors = ['#ff6b6b', '#51cf66']
+                        ax.pie(sizes, labels=labels, autopct='%1.1f%%', colors=colors, startangle=90)
+                        ax.axis('equal')
+                        st.pyplot(fig)
+                    else:
+                        st.info("Нет остатков для построения диаграммы.")
 
                 with tab2:
                     st.subheader("🔍 Детальная оборачиваемость по товарам и городам")
@@ -437,7 +642,6 @@ if st.button("🚀 Рассчитать KPI"):
                                 "Оборачиваемость_дни": st.column_config.TextColumn("Оборачиваемость (дни)"),
                             }
                         )
-
                         st.caption(f"Всего проблемных позиций: {len(over_df)}")
                         csv = over_df.to_csv(index=False).encode('utf-8')
                         st.download_button(
@@ -446,6 +650,70 @@ if st.button("🚀 Рассчитать KPI"):
                             file_name=f"detected_turnover_issues_{month_names[month2_num]}.csv",
                             mime="text/csv",
                         )
+
+                with tab3:
+                    st.subheader("🏙️ Аналитика по городам")
+                    city_metrics = result['city_metrics']
+                    if not city_metrics:
+                        st.info("Нет данных по городам.")
+                    else:
+                        # Собираем DataFrame для отображения
+                        rows = []
+                        for city, metrics in city_metrics.items():
+                            rows.append({
+                                'Город': city,
+                                'In-Stock Retail, %': round(metrics['in_stock_pct'], 1) if metrics['in_stock_pct'] is not None else '—',
+                                'Оборачиваемость, дни': round(metrics['turnover_days'], 1) if metrics['turnover_days'] != float('inf') else '∞',
+                                'Упущенная прибыль, %': round(metrics['lost_profit_pct'], 2),
+                                'Недопроданно, шт': int(metrics['lost_profit_qty']),
+                                'Неликвид, %': round(metrics['dead_stock_pct'], 2),
+                                'Неликвид, шт': int(metrics['dead_stock_qty']),
+                                'Продажи, шт': int(metrics['total_sales']),
+                                'Остаток, шт': int(metrics['total_stock'])
+                            })
+                        df_city = pd.DataFrame(rows)
+                        st.dataframe(df_city, use_container_width=True)
+
+                        # Скачать таблицу по городам
+                        csv_city = df_city.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="📥 Скачать аналитику по городам (CSV)",
+                            data=csv_city,
+                            file_name=f"city_analytics_{month_names[month2_num]}.csv",
+                            mime="text/csv",
+                        )
+
+                        # Список проблемных позиций (дефицит и неликвид)
+                        st.subheader("⚠️ Проблемные позиции")
+                        # Дефицит: остаток = 0 и Ср_продажа > 0
+                        deficit_df = df_m2[(df_m2['Остаток'] == 0) & (df_m2['Ср_продажа'] > min_avg_sales)]
+                        if not deficit_df.empty:
+                            st.write("**Дефицит (товар закончился, но продавался):**")
+                            st.dataframe(
+                                deficit_df[['Номенклатура', 'Характеристика', 'Город', 'Ср_продажа', 'Количество']],
+                                use_container_width=True
+                            )
+                        else:
+                            st.success("✅ Нет дефицита по продаваемым товарам.")
+
+                        # Неликвид: товары без продаж за 2 месяца с остатком > 0
+                        # Используем уже вычисленные dead_keys
+                        dead_keys = set()
+                        sales_m1 = df_m1.groupby(['Номенклатура', 'Характеристика'])['Количество'].sum().reset_index()
+                        sales_m2 = df_m2.groupby(['Номенклатура', 'Характеристика'])['Количество'].sum().reset_index()
+                        merged_dead = pd.merge(sales_m1, sales_m2, on=['Номенклатура', 'Характеристика'],
+                                               how='outer', suffixes=('_m1', '_m2')).fillna(0)
+                        dead_items = merged_dead[(merged_dead['Количество_m1'] == 0) & (merged_dead['Количество_m2'] == 0)]
+                        dead_keys = set(zip(dead_items['Номенклатура'], dead_items['Характеристика']))
+                        dead_stock_positions = df_m2[df_m2.apply(lambda row: (row['Номенклатура'], row['Характеристика']) in dead_keys and row['Остаток'] > 0, axis=1)]
+                        if not dead_stock_positions.empty:
+                            st.write("**Неликвид (товары без продаж за 2 месяца, остаток > 0):**")
+                            st.dataframe(
+                                dead_stock_positions[['Номенклатура', 'Характеристика', 'Город', 'Остаток']],
+                                use_container_width=True
+                            )
+                        else:
+                            st.success("✅ Нет неликвида.")
 
             except Exception as e:
                 st.error(f"Ошибка при обработке: {e}")
