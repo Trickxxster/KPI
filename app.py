@@ -175,8 +175,6 @@ def load_prices(file):
         # Удаляем строки, где Номенклатура пустая или состоит из служебных слов
         df_sub = df_sub[df_sub['Номенклатура'].notna()]
         df_sub = df_sub[df_sub['Номенклатура'].str.strip() != '']
-        # Дополнительная фильтрация: если Номенклатура не содержит хотя бы одну букву (только цифры или спецсимволы) – пропускаем
-        # Но оставим как есть, т.к. цены уже отфильтровали
         all_data.append(df_sub)
     
     if not all_data:
@@ -195,7 +193,7 @@ def match_prices(df_products, df_prices, threshold=0.7):
     """
     Для каждого уникального товара (номенклатура + характеристика) из df_products
     ищет наиболее похожее название в df_prices с помощью difflib.
-    Возвращает словарь { (номенклатура, характеристика): (закупочная_цена, ррц) }
+    Возвращает словарь { (номенклатура, характеристика): (себестоимость, ррц) }
     """
     if df_prices.empty:
         return {}
@@ -317,15 +315,16 @@ def calculate_kpi(df_month1, df_month2,
     lost_profit_revenue = None
     lost_profit_margin = None
     if use_prices and price_dict:
-        # Присоединяем цены к df_month2
-        df_month2['Закупочная_цена'] = df_month2.apply(
-            lambda row: price_dict.get((row['Номенклатура'], row['Характеристика']), (None, None))[0],
-            axis=1
-        )
-        df_month2['РРЦ'] = df_month2.apply(
-            lambda row: price_dict.get((row['Номенклатура'], row['Характеристика']), (None, None))[1],
-            axis=1
-        )
+        # Присоединяем цены к df_month2 (если ещё не присоединены)
+        if 'Закупочная_цена' not in df_month2.columns:
+            df_month2['Закупочная_цена'] = df_month2.apply(
+                lambda row: price_dict.get((row['Номенклатура'], row['Характеристика']), (None, None))[0],
+                axis=1
+            )
+            df_month2['РРЦ'] = df_month2.apply(
+                lambda row: price_dict.get((row['Номенклатура'], row['Характеристика']), (None, None))[1],
+                axis=1
+            )
         # Для строк с недопроданным > 0 считаем потери
         lost_rows = df_month2[df_month2['Недопроданное'] > 0]
         if not lost_rows.empty:
@@ -444,11 +443,13 @@ def calculate_kpi(df_month1, df_month2,
         'lost_profit_margin': lost_profit_margin,
         'price_dict_used': price_dict is not None and use_prices
     }
+    # Сохраняем dead_keys для последующего использования в таблицах
+    result['dead_keys'] = dead_keys
     return result
 
 
 # ------------------------------------------------------------
-# 7. Детальный расчёт оборачиваемости по товарам и городам (без изменений)
+# 7. Детальный расчёт оборачиваемости по товарам и городам
 # ------------------------------------------------------------
 def compute_detailed_turnover(df_month1, df_month2, days_in_month2, target_turnover):
     merged = pd.merge(
@@ -476,7 +477,22 @@ def compute_detailed_turnover(df_month1, df_month2, days_in_month2, target_turno
 
 
 # ------------------------------------------------------------
-# 8. Интерфейс Streamlit
+# 8. Вспомогательная функция для отображения метрик с подсказками
+# ------------------------------------------------------------
+def metric_with_tooltip(label, value, delta, tooltip, delta_color="normal"):
+    """
+    Отображает метрику с всплывающей подсказкой (tooltip) при наведении на значок ⓘ.
+    """
+    st.markdown(f"""
+    <div style="margin-bottom: 0.25rem;">
+        <span style="font-weight: bold; font-size: 1rem;" title="{tooltip}">{label} ⓘ</span>
+    </div>
+    """, unsafe_allow_html=True)
+    st.metric(label="", value=value, delta=delta, delta_color=delta_color)
+
+
+# ------------------------------------------------------------
+# 9. Интерфейс Streamlit
 # ------------------------------------------------------------
 st.set_page_config(page_title="KPI Категорийного менеджера", layout="wide")
 st.title("📊 Оценка эффективности категорийного менеджера")
@@ -553,6 +569,17 @@ if st.button("🚀 Рассчитать KPI"):
                     else:
                         st.warning("Файл с ценами не загружен или имеет неверный формат.")
 
+                # Если цены загружены, обогащаем df_m2 колонками с ценами для отображения в таблицах
+                if price_dict:
+                    df_m2['Закупочная_цена'] = df_m2.apply(
+                        lambda row: price_dict.get((row['Номенклатура'], row['Характеристика']), (None, None))[0],
+                        axis=1
+                    )
+                    df_m2['РРЦ'] = df_m2.apply(
+                        lambda row: price_dict.get((row['Номенклатура'], row['Характеристика']), (None, None))[1],
+                        axis=1
+                    )
+
                 # Основной расчёт
                 result = calculate_kpi(df_m1, df_m2, days_in_month2,
                                        target_in_stock, target_turnover,
@@ -578,26 +605,27 @@ if st.button("🚀 Рассчитать KPI"):
                         st.error(f"**{result['bonus']} руб.**")
                     st.caption(result['bonus_detail'])
 
-                    # Визуализация выполнения целей (прогресс-бары)
+                    # Визуализация выполнения целей (прогресс-бары) с подсказками
+                    st.subheader("🎯 Драйверные KPI")
                     col_a, col_b = st.columns(2)
                     with col_a:
-                        st.metric(
+                        metric_with_tooltip(
                             label="In‑Stock Retail",
                             value=f"{result['in_stock_pct']:.1f}%",
                             delta=f"Цель: {target_in_stock}%",
+                            tooltip="Доля товаров, которые продавались в городе за последние 2 месяца и есть в наличии на конец отчётного месяца. Рассчитывается как среднее по городам.\n\nФормула: (количество продаваемых товаров в наличии / общее количество продаваемых товаров в городе) × 100%",
                             delta_color="normal" if result['in_stock_ok'] else "inverse"
                         )
-                        # Прогресс-бар
                         progress_in = min(result['in_stock_pct'] / target_in_stock, 1.0) if target_in_stock > 0 else 0
                         st.progress(progress_in, text=f"{result['in_stock_pct']:.1f}% от цели")
                     with col_b:
-                        st.metric(
+                        metric_with_tooltip(
                             label="Оборачиваемость (дни)",
                             value=f"{result['turnover_days']:.1f}" if result['turnover_days'] != float('inf') else "∞",
                             delta=f"Цель: ≤ {target_turnover}",
+                            tooltip="Средний срок хранения запаса в днях по всей сети.\n\nФормула: (средний остаток за месяц в штуках) / (среднедневные продажи в штуках)",
                             delta_color="normal" if result['turnover_ok'] else "inverse"
                         )
-                        # Прогресс-бар (обратный: чем меньше, тем лучше)
                         if result['turnover_days'] != float('inf'):
                             progress_turn = max(0, min(1 - (result['turnover_days'] / (target_turnover * 2)), 1))
                             st.progress(progress_turn, text=f"{result['turnover_days']:.1f} дн. (норма ≤ {target_turnover})")
@@ -608,10 +636,11 @@ if st.button("🚀 Рассчитать KPI"):
                     st.subheader("⛔ Стоп-факторы (обнуляют премию)")
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.metric(
+                        metric_with_tooltip(
                             label="Упущенная прибыль",
                             value=f"{result['lost_profit_pct']:.2f}%",
                             delta=f"Лимит: ≤ {limit_lost_profit}%",
+                            tooltip="Доля недопроданных штук от общего спроса. Считается, что если остаток = 0, то весь потенциальный спрос за месяц был упущен. Учитываются только товары, которые продавались (среднедневные продажи > 0).\n\nФормула: (недопроданные штуки / (проданные штуки + недопроданные штуки)) × 100%",
                             delta_color="normal" if result['lost_profit_ok'] else "inverse"
                         )
                         st.caption(f"Недопроданных штук: {result['total_lost_qty']:,.0f} из {result['total_sales_qty'] + result['total_lost_qty']:,.0f}")
@@ -619,15 +648,16 @@ if st.button("🚀 Рассчитать KPI"):
                             st.caption(f"Упущенная выручка: {result['lost_profit_revenue']:,.0f} руб." if result['lost_profit_revenue'] else "—")
                             st.caption(f"Упущенная маржа: {result['lost_profit_margin']:,.0f} руб." if result['lost_profit_margin'] else "—")
                     with col2:
-                        st.metric(
+                        metric_with_tooltip(
                             label="Неликвид",
                             value=f"{result['dead_stock_pct']:.2f}%",
                             delta=f"Лимит: ≤ {limit_dead_stock}%",
+                            tooltip="Доля остатка (в штуках) товаров, которые не продавались ни в предыдущем, ни в отчётном месяце.\n\nФормула: (остаток неликвидов в штуках / общий остаток в штуках) × 100%",
                             delta_color="normal" if result['dead_stock_ok'] else "inverse"
                         )
                         st.caption(f"Товаров без продаж за 2 месяца: {result['dead_items_count']}")
 
-                    # Простая визуализация структуры запасов (без matplotlib)
+                    # Структура запасов
                     if result['total_stock_qty'] > 0:
                         dead_share = result['dead_stock_pct']
                         st.write("**Структура запасов:**")
@@ -701,32 +731,50 @@ if st.button("🚀 Рассчитать KPI"):
 
                         # Список проблемных позиций (дефицит и неликвид)
                         st.subheader("⚠️ Проблемные позиции")
-                        # Дефицит: остаток = 0 и Ср_продажа > 0
-                        deficit_df = df_m2[(df_m2['Остаток'] == 0) & (df_m2['Ср_продажа'] > min_avg_sales)]
+                        
+                        # 1. Дефицит: остаток = 0 и Ср_продажа > 0
+                        deficit_df = df_m2[(df_m2['Остаток'] == 0) & (df_m2['Ср_продажа'] > min_avg_sales)].copy()
                         if not deficit_df.empty:
+                            # Рассчитываем недопроданное количество и сумму в РРЦ
+                            deficit_df['Недопроданное'] = deficit_df['Ср_продажа'] * days_in_month2
+                            if 'РРЦ' in deficit_df.columns:
+                                deficit_df['Сумма в РРЦ'] = deficit_df['Недопроданное'] * deficit_df['РРЦ']
+                            else:
+                                deficit_df['Сумма в РРЦ'] = None
                             st.write("**Дефицит (товар закончился, но продавался):**")
+                            display_cols = ['Номенклатура', 'Характеристика', 'Город', 'Ср_продажа', 'Недопроданное']
+                            if 'Сумма в РРЦ' in deficit_df.columns:
+                                display_cols.append('Сумма в РРЦ')
                             st.dataframe(
-                                deficit_df[['Номенклатура', 'Характеристика', 'Город', 'Ср_продажа', 'Количество']],
-                                use_container_width=True
+                                deficit_df[display_cols],
+                                use_container_width=True,
+                                column_config={
+                                    "Недопроданное": st.column_config.NumberColumn("Недопроданно, шт", format="%.0f"),
+                                    "Сумма в РРЦ": st.column_config.NumberColumn("Сумма в РРЦ, руб", format="%.0f") if 'Сумма в РРЦ' in deficit_df.columns else None,
+                                }
                             )
                         else:
                             st.success("✅ Нет дефицита по продаваемым товарам.")
 
-                        # Неликвид: товары без продаж за 2 месяца с остатком > 0
-                        # Используем уже вычисленные dead_keys
-                        dead_keys = set()
-                        sales_m1 = df_m1.groupby(['Номенклатура', 'Характеристика'])['Количество'].sum().reset_index()
-                        sales_m2 = df_m2.groupby(['Номенклатура', 'Характеристика'])['Количество'].sum().reset_index()
-                        merged_dead = pd.merge(sales_m1, sales_m2, on=['Номенклатура', 'Характеристика'],
-                                               how='outer', suffixes=('_m1', '_m2')).fillna(0)
-                        dead_items = merged_dead[(merged_dead['Количество_m1'] == 0) & (merged_dead['Количество_m2'] == 0)]
-                        dead_keys = set(zip(dead_items['Номенклатура'], dead_items['Характеристика']))
-                        dead_stock_positions = df_m2[df_m2.apply(lambda row: (row['Номенклатура'], row['Характеристика']) in dead_keys and row['Остаток'] > 0, axis=1)]
+                        # 2. Неликвид: товары без продаж за 2 месяца с остатком > 0
+                        dead_keys = result.get('dead_keys', set())
+                        dead_stock_positions = df_m2[df_m2.apply(lambda row: (row['Номенклатура'], row['Характеристика']) in dead_keys and row['Остаток'] > 0, axis=1)].copy()
                         if not dead_stock_positions.empty:
+                            if 'Закупочная_цена' in dead_stock_positions.columns:
+                                dead_stock_positions['Сумма в закупке'] = dead_stock_positions['Остаток'] * dead_stock_positions['Закупочная_цена']
+                            else:
+                                dead_stock_positions['Сумма в закупке'] = None
                             st.write("**Неликвид (товары без продаж за 2 месяца, остаток > 0):**")
+                            display_cols = ['Номенклатура', 'Характеристика', 'Город', 'Остаток']
+                            if 'Сумма в закупке' in dead_stock_positions.columns:
+                                display_cols.append('Сумма в закупке')
                             st.dataframe(
-                                dead_stock_positions[['Номенклатура', 'Характеристика', 'Город', 'Остаток']],
-                                use_container_width=True
+                                dead_stock_positions[display_cols],
+                                use_container_width=True,
+                                column_config={
+                                    "Остаток": st.column_config.NumberColumn("Остаток, шт", format="%.0f"),
+                                    "Сумма в закупке": st.column_config.NumberColumn("Сумма в закупке, руб", format="%.0f") if 'Сумма в закупке' in dead_stock_positions.columns else None,
+                                }
                             )
                         else:
                             st.success("✅ Нет неликвида.")
