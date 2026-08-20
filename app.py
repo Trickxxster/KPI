@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from calendar import monthrange
-from rapidfuzz import process, fuzz
+import difflib   # вместо rapidfuzz – встроенная библиотека
 import io
 
 # ------------------------------------------------------------
@@ -171,12 +171,12 @@ def load_prices(file):
 
 
 # ------------------------------------------------------------
-# 4. Сопоставление товаров с прайс-листом (нечёткое)
+# 4. Сопоставление товаров с прайс-листом (нечёткое через difflib)
 # ------------------------------------------------------------
-def match_prices(df_products, df_prices, threshold=80):
+def match_prices(df_products, df_prices, threshold=0.6):
     """
     Для каждого уникального товара (номенклатура + характеристика) из df_products
-    ищет наиболее похожее название в df_prices.
+    ищет наиболее похожее название в df_prices с помощью difflib.
     Возвращает словарь { (номенклатура, характеристика): (закупочная_цена, ррц) }
     """
     if df_prices.empty:
@@ -198,9 +198,11 @@ def match_prices(df_products, df_prices, threshold=80):
         search_key = normalize_text(prod_row['Номенклатура']) + ' ' + normalize_text(prod_row.get('Характеристика', ''))
         if search_key.strip() == '':
             continue
-        # Ищем лучшее совпадение
-        best_match, score, idx = process.extractOne(search_key, price_keys, scorer=fuzz.token_sort_ratio)
-        if score >= threshold:
+        # Ищем лучшее совпадение через difflib
+        matches = difflib.get_close_matches(search_key, price_keys, n=1, cutoff=threshold)
+        if matches:
+            best_match = matches[0]
+            idx = price_keys.index(best_match)
             matched_row = df_prices.iloc[price_indices[idx]]
             match_dict[(prod_row['Номенклатура'], prod_row['Характеристика'])] = (
                 matched_row['Закупочная_цена'],
@@ -527,7 +529,7 @@ if st.button("🚀 Рассчитать KPI"):
                 if use_prices and price_file is not None:
                     df_prices = load_prices(price_file)
                     if not df_prices.empty:
-                        price_dict = match_prices(df_m2, df_prices, threshold=80)
+                        price_dict = match_prices(df_m2, df_prices, threshold=0.6)
                         if not price_dict:
                             st.warning("Не удалось сопоставить ни одного товара с прайс-листом. Проверьте названия.")
                     else:
@@ -607,18 +609,14 @@ if st.button("🚀 Рассчитать KPI"):
                         )
                         st.caption(f"Товаров без продаж за 2 месяца: {result['dead_items_count']}")
 
-                    # Круговая диаграмма для структуры запасов (неликвид vs остальное)
+                    # Простая визуализация структуры запасов (без matplotlib)
                     if result['total_stock_qty'] > 0:
-                        import matplotlib.pyplot as plt
-                        fig, ax = plt.subplots(figsize=(4, 4))
-                        sizes = [result['dead_stock_qty'], result['total_stock_qty'] - result['dead_stock_qty']]
-                        labels = ['Неликвид', 'Оборотный запас']
-                        colors = ['#ff6b6b', '#51cf66']
-                        ax.pie(sizes, labels=labels, autopct='%1.1f%%', colors=colors, startangle=90)
-                        ax.axis('equal')
-                        st.pyplot(fig)
+                        dead_share = result['dead_stock_pct']
+                        st.write("**Структура запасов:**")
+                        st.progress(dead_share / 100, text=f"Неликвид: {dead_share:.1f}%")
+                        st.caption(f"Оборотный запас: {100 - dead_share:.1f}%")
                     else:
-                        st.info("Нет остатков для построения диаграммы.")
+                        st.info("Нет остатков для анализа.")
 
                 with tab2:
                     st.subheader("🔍 Детальная оборачиваемость по товарам и городам")
