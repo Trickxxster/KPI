@@ -486,14 +486,45 @@ def compute_detailed_turnover(df_month1, df_month2, days_in_month2, target_turno
 # 8. Вспомогательная функция для отображения метрик с подсказками
 # ------------------------------------------------------------
 def metric_with_tooltip(label, value, delta, tooltip, delta_color="normal"):
-    """
-    Отображает метрику с всплывающей подсказкой (tooltip) при наведении на значок ⓘ.
-    """
-    st.markdown(f"""
-    <div style="margin-bottom: 0.25rem;">
-        <span style="font-weight: bold; font-size: 1rem;" title="{tooltip}">{label} ⓘ</span>
+        html = f"""
+    <div style="margin-bottom: 0.25rem; display: flex; align-items: center; gap: 5px;">
+        <span style="font-weight: bold; font-size: 1rem;">{label}</span>
+        <span class="custom-tooltip" style="cursor: help; border-bottom: 1px dotted #aaa; position: relative; display: inline-block;">
+            ⓘ
+            <span class="tooltiptext" style="
+                visibility: hidden;
+                width: 280px;
+                background-color: #333;
+                color: #fff;
+                text-align: left;
+                border-radius: 6px;
+                padding: 8px 10px;
+                position: absolute;
+                z-index: 1000;
+                bottom: 150%;
+                left: 50%;
+                transform: translateX(-50%);
+                opacity: 0;
+                transition: opacity 0.3s;
+                font-weight: normal;
+                font-size: 0.85rem;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.4);
+                white-space: normal;
+                word-wrap: break-word;
+                line-height: 1.4;
+            ">
+                {tooltip}
+            </span>
+        </span>
     </div>
-    """, unsafe_allow_html=True)
+    <style>
+        .custom-tooltip:hover .tooltiptext {{
+            visibility: visible;
+            opacity: 1;
+        }}
+    </style>
+    """
+    st.markdown(html, unsafe_allow_html=True)
     st.metric(label="", value=value, delta=delta, delta_color=delta_color)
 
 
