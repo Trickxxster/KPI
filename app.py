@@ -3,8 +3,7 @@ import pandas as pd
 import numpy as np
 from calendar import monthrange
 import difflib
-import io
-import re  # для улучшенной нормализации
+import re
 
 # ------------------------------------------------------------
 # 1. Парсер Excel-файла (без изменений)
@@ -123,7 +122,7 @@ def normalize_text(text):
 
 
 # ------------------------------------------------------------
-# 3. Загрузка прайс-листа (только Excel, убрана поддержка CSV)
+# 3. Загрузка прайс-листа (только Excel)
 # ------------------------------------------------------------
 def load_prices(file):
     """
@@ -448,7 +447,7 @@ def calculate_kpi(df_month1, df_month2,
 
 
 # ------------------------------------------------------------
-# 7. Детальный расчёт оборачиваемости по товарам и городам (исправлено)
+# 7. Детальный расчёт оборачиваемости по товарам и городам
 # ------------------------------------------------------------
 def compute_detailed_turnover(df_month1, df_month2, days_in_month2, target_turnover):
     merged = pd.merge(
@@ -483,22 +482,25 @@ def compute_detailed_turnover(df_month1, df_month2, days_in_month2, target_turno
 
 
 # ------------------------------------------------------------
-# 8. Вспомогательная функция для отображения метрик с подсказками
+# 8. Функция для отображения метрик с работающей всплывающей подсказкой (исправлена)
 # ------------------------------------------------------------
 def metric_with_tooltip(label, value, delta, tooltip, delta_color="normal"):
-        html = f"""
+    """
+    Отображает метрику с всплывающей подсказкой (tooltip) при наведении на значок ⓘ.
+    """
+    html = f"""
     <div style="margin-bottom: 0.25rem; display: flex; align-items: center; gap: 5px;">
         <span style="font-weight: bold; font-size: 1rem;">{label}</span>
         <span class="custom-tooltip" style="cursor: help; border-bottom: 1px dotted #aaa; position: relative; display: inline-block;">
             ⓘ
             <span class="tooltiptext" style="
                 visibility: hidden;
-                width: 280px;
+                width: 300px;
                 background-color: #333;
                 color: #fff;
                 text-align: left;
                 border-radius: 6px;
-                padding: 8px 10px;
+                padding: 8px 12px;
                 position: absolute;
                 z-index: 1000;
                 bottom: 150%;
