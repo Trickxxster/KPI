@@ -4,6 +4,7 @@ import numpy as np
 from calendar import monthrange
 import difflib
 import io
+import re  # для улучшенной нормализации
 
 # ------------------------------------------------------------
 # 1. Парсер Excel-файла (без изменений)
@@ -109,31 +110,30 @@ def parse_excel(file):
 
 
 # ------------------------------------------------------------
-# 2. Нормализация строк для сопоставления
+# 2. Нормализация строк для сопоставления (улучшена)
 # ------------------------------------------------------------
 def normalize_text(text):
-    """Приводит строку к единому формату: нижний регистр, удаление лишних пробелов."""
+    """Приводит строку к единому формату: нижний регистр, удаление лишних пробелов и спецсимволов."""
     if pd.isna(text):
         return ''
-    return str(text).lower().strip()
+    text = str(text).lower().strip()
+    # Оставляем только буквы, цифры и пробелы
+    text = re.sub(r'[^a-zа-яё0-9\s]', '', text)
+    return ' '.join(text.split())
 
 
 # ------------------------------------------------------------
-# 3. Загрузка прайс-листа (многостраничный Excel, игнорирование подзаголовков)
+# 3. Загрузка прайс-листа (только Excel, убрана поддержка CSV)
 # ------------------------------------------------------------
 def load_prices(file):
     """
-    Загружает файл с ценами (Excel с несколькими листами или CSV).
+    Загружает файл с ценами (Excel с несколькими листами).
     Ожидает колонки: 'Номенклатура', 'Характеристика', 'Себестоимость', 'РРЦ'.
     Если названия колонок отличаются, пытается угадать.
     Игнорирует строки, где Номенклатура не является товаром (пустые или подзаголовки).
     """
-    if file.name.endswith('.csv'):
-        df = pd.read_csv(file)
-        sheets = [df]
-    else:
-        xls = pd.ExcelFile(file)
-        sheets = [pd.read_excel(xls, sheet_name=sheet) for sheet in xls.sheet_names]
+    xls = pd.ExcelFile(file)
+    sheets = [pd.read_excel(xls, sheet_name=sheet) for sheet in xls.sheet_names]
     
     all_data = []
     for df in sheets:
@@ -498,7 +498,7 @@ def metric_with_tooltip(label, value, delta, tooltip, delta_color="normal"):
 
 
 # ------------------------------------------------------------
-# 9. Интерфейс Streamlit
+# 9. Интерфейс Streamlit (обновлён)
 # ------------------------------------------------------------
 st.set_page_config(page_title="KPI Категорийного менеджера", layout="wide")
 st.title("📊 Оценка эффективности категорийного менеджера")
@@ -521,35 +521,42 @@ min_avg_sales = st.sidebar.number_input(
     min_value=0.0, value=0.01, step=0.01, format="%.3f"
 )
 
+# --- Выбор периода (месяц + год) для каждого файла ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("📅 Периоды")
+col_year1, col_month1 = st.sidebar.columns(2)
+with col_year1:
+    year1 = st.number_input("Год (Месяц 1)", min_value=2000, max_value=2100, value=2025, step=1)
+with col_month1:
+    month1_num = st.selectbox("Месяц 1", options=list(month_names.keys()), format_func=lambda x: month_names[x], index=5)
+
+col_year2, col_month2 = st.sidebar.columns(2)
+with col_year2:
+    year2 = st.number_input("Год (Месяц 2)", min_value=2000, max_value=2100, value=2025, step=1)
+with col_month2:
+    month2_num = st.selectbox("Месяц 2", options=list(month_names.keys()), format_func=lambda x: month_names[x], index=6)
+
+days_in_month2 = monthrange(year2, month2_num)[1]
+st.sidebar.caption(f"Количество дней во втором месяце ({month_names[month2_num]} {year2}): {days_in_month2}")
+
 # Загрузка прайс-листа
 st.sidebar.markdown("---")
 st.sidebar.subheader("💰 Цены для расчёта упущенной прибыли")
-use_prices = st.sidebar.checkbox("Использовать цены (Excel/CSV)", value=False)
+use_prices = st.sidebar.checkbox("Использовать цены (Excel)", value=False)
 price_file = None
 if use_prices:
-    price_file = st.sidebar.file_uploader("Загрузите файл с ценами", type=["xlsx", "csv"])
+    price_file = st.sidebar.file_uploader("Загрузите файл с ценами", type=["xlsx", "xls"])
     st.sidebar.caption("Ожидаются колонки: Номенклатура, Характеристика, Себестоимость, РРЦ")
 
 st.markdown("---")
 st.write("Загрузите два Excel-файла: **первый** (предыдущий месяц) и **второй** (отчётный месяц).")
 st.caption("Структура файлов должна строго соответствовать образцу (первые две строки – заголовки городов и полей).")
 
-# Выбор месяцев
-col_m1, col_m2 = st.columns(2)
-with col_m1:
-    month1_num = st.selectbox("Выберите первый месяц (предыдущий)", options=list(month_names.keys()), format_func=lambda x: month_names[x], index=5)
-with col_m2:
-    month2_num = st.selectbox("Выберите второй месяц (отчётный)", options=list(month_names.keys()), format_func=lambda x: month_names[x], index=6)
-
-days_in_month2 = monthrange(2026, month2_num)[1]  # год можно задать динамически, но для простоты оставим 2026
-
-st.write(f"**Количество дней во втором месяце ({month_names[month2_num]}):** {days_in_month2}")
-
 col1, col2 = st.columns(2)
 with col1:
-    file_month1 = st.file_uploader(f"📁 Файл за {month_names[month1_num]} (Месяц 1)", type=["xlsx"])
+    file_month1 = st.file_uploader(f"📁 Файл за {month_names[month1_num]} {year1} (Месяц 1)", type=["xlsx"])
 with col2:
-    file_month2 = st.file_uploader(f"📁 Файл за {month_names[month2_num]} (Месяц 2)", type=["xlsx"])
+    file_month2 = st.file_uploader(f"📁 Файл за {month_names[month2_num]} {year2} (Месяц 2)", type=["xlsx"])
 
 if st.button("🚀 Рассчитать KPI"):
     if file_month1 is None or file_month2 is None:
@@ -560,20 +567,33 @@ if st.button("🚀 Рассчитать KPI"):
                 df_m1 = parse_excel(file_month1)
                 df_m2 = parse_excel(file_month2)
 
-                if df_m1.empty or df_m2.empty:
-                    st.error("Не удалось распознать структуру файлов. Проверьте формат.")
+                # --- Валидация загруженных данных ---
+                if df_m1.empty:
+                    st.error("Первый файл не содержит данных или имеет неверную структуру.")
+                    st.stop()
+                if df_m2.empty:
+                    st.error("Второй файл не содержит данных или имеет неверную структуру.")
+                    st.stop()
+                # Проверяем, что есть хотя бы одна строка с номенклатурой (не пустая)
+                if df_m1['Номенклатура'].isna().all() or (df_m1['Номенклатура'].str.strip() == '').all():
+                    st.error("В первом файле не найдено ни одного товара (столбец 'Номенклатура' пуст).")
+                    st.stop()
+                if df_m2['Номенклатура'].isna().all() or (df_m2['Номенклатура'].str.strip() == '').all():
+                    st.error("Во втором файле не найдено ни одного товара (столбец 'Номенклатура' пуст).")
                     st.stop()
 
                 # Загрузка прайса, если включено
                 price_dict = None
                 if use_prices and price_file is not None:
                     df_prices = load_prices(price_file)
-                    if not df_prices.empty:
+                    if df_prices.empty:
+                        st.warning("Файл с ценами пуст или имеет неверный формат. Расчёт будет выполнен без учёта цен.")
+                    else:
                         price_dict = match_prices(df_m2, df_prices, threshold=0.7)
                         if not price_dict:
-                            st.warning("Не удалось сопоставить ни одного товара с прайс-листом. Проверьте названия.")
-                    else:
-                        st.warning("Файл с ценами не загружен или имеет неверный формат.")
+                            st.warning("Не удалось сопоставить ни одного товара с прайс-листом. Проверьте названия. Расчёт продолжится без цен.")
+                elif use_prices and price_file is None:
+                    st.warning("Цены включены, но файл не загружен. Расчёт будет выполнен без цен.")
 
                 # Если цены загружены, обогащаем df_m2 колонками с ценами для отображения в таблицах
                 if price_dict:
@@ -699,7 +719,7 @@ if st.button("🚀 Рассчитать KPI"):
                         st.download_button(
                             label="📥 Скачать отчёт по оборачиваемости (CSV)",
                             data=csv,
-                            file_name=f"detected_turnover_issues_{month_names[month2_num]}.csv",
+                            file_name=f"detected_turnover_issues_{month_names[month2_num]}_{year2}.csv",
                             mime="text/csv",
                         )
 
@@ -731,7 +751,7 @@ if st.button("🚀 Рассчитать KPI"):
                         st.download_button(
                             label="📥 Скачать аналитику по городам (CSV)",
                             data=csv_city,
-                            file_name=f"city_analytics_{month_names[month2_num]}.csv",
+                            file_name=f"city_analytics_{month_names[month2_num]}_{year2}.csv",
                             mime="text/csv",
                         )
 
