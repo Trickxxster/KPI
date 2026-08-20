@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from calendar import monthrange
-import difflib   # вместо rapidfuzz – встроенная библиотека
+import difflib
 import io
 
 # ------------------------------------------------------------
@@ -119,61 +119,79 @@ def normalize_text(text):
 
 
 # ------------------------------------------------------------
-# 3. Загрузка прайс-листа
+# 3. Загрузка прайс-листа (многостраничный Excel, игнорирование подзаголовков)
 # ------------------------------------------------------------
 def load_prices(file):
     """
-    Загружает файл с ценами (Excel или CSV).
-    Ожидает колонки: 'Номенклатура', 'Характеристика', 'Закупочная_цена', 'РРЦ'.
+    Загружает файл с ценами (Excel с несколькими листами или CSV).
+    Ожидает колонки: 'Номенклатура', 'Характеристика', 'Себестоимость', 'РРЦ'.
     Если названия колонок отличаются, пытается угадать.
+    Игнорирует строки, где Номенклатура не является товаром (пустые или подзаголовки).
     """
     if file.name.endswith('.csv'):
         df = pd.read_csv(file)
+        sheets = [df]
     else:
-        df = pd.read_excel(file)
+        xls = pd.ExcelFile(file)
+        sheets = [pd.read_excel(xls, sheet_name=sheet) for sheet in xls.sheet_names]
     
-    # Попытка найти нужные колонки
-    col_map = {}
-    for col in df.columns:
-        col_lower = col.lower().strip()
-        if 'номенклатур' in col_lower or 'название' in col_lower or 'товар' in col_lower:
-            col_map['Номенклатура'] = col
-        elif 'характеристик' in col_lower or 'модель' in col_lower or 'артикул' in col_lower:
-            col_map['Характеристика'] = col
-        elif 'закуп' in col_lower or 'себестоим' in col_lower:
-            col_map['Закупочная_цена'] = col
-        elif 'ррц' in col_lower or 'розничн' in col_lower or 'цена' in col_lower:
-            col_map['РРЦ'] = col
+    all_data = []
+    for df in sheets:
+        if df.empty:
+            continue
+        # Определяем колонки
+        col_map = {}
+        for col in df.columns:
+            col_lower = col.lower().strip()
+            if 'номенклатур' in col_lower or 'название' in col_lower or 'товар' in col_lower:
+                col_map['Номенклатура'] = col
+            elif 'характеристик' in col_lower or 'модель' in col_lower or 'артикул' in col_lower:
+                col_map['Характеристика'] = col
+            elif 'себестоим' in col_lower or 'закуп' in col_lower:
+                col_map['Себестоимость'] = col
+            elif 'ррц' in col_lower or 'розничн' in col_lower or 'цена' in col_lower:
+                col_map['РРЦ'] = col
+        # Если не нашли все, пробуем по позициям (если их 4)
+        if len(col_map) < 4:
+            if len(df.columns) >= 4:
+                col_map = {
+                    'Номенклатура': df.columns[0],
+                    'Характеристика': df.columns[1],
+                    'Себестоимость': df.columns[2],
+                    'РРЦ': df.columns[3]
+                }
+            else:
+                continue  # пропускаем лист
+        
+        # Переименовываем
+        df_renamed = df.rename(columns=col_map)
+        # Оставляем нужные колонки
+        df_sub = df_renamed[['Номенклатура', 'Характеристика', 'Себестоимость', 'РРЦ']].copy()
+        # Преобразуем цены в числа
+        for col in ['Себестоимость', 'РРЦ']:
+            df_sub[col] = pd.to_numeric(df_sub[col], errors='coerce')
+        # Удаляем строки, где нет ни себестоимости, ни РРЦ (это подзаголовки)
+        df_sub = df_sub.dropna(subset=['Себестоимость', 'РРЦ'], how='all')
+        # Удаляем строки, где Номенклатура пустая или состоит из служебных слов
+        df_sub = df_sub[df_sub['Номенклатура'].notna()]
+        df_sub = df_sub[df_sub['Номенклатура'].str.strip() != '']
+        # Дополнительная фильтрация: если Номенклатура не содержит хотя бы одну букву (только цифры или спецсимволы) – пропускаем
+        # Но оставим как есть, т.к. цены уже отфильтровали
+        all_data.append(df_sub)
     
-    # Если не нашли все, используем первые колонки (предполагаем, что структура: Номенклатура, Характеристика, Закупка, РРЦ)
-    if len(col_map) < 4:
-        if len(df.columns) >= 4:
-            col_map = {
-                'Номенклатура': df.columns[0],
-                'Характеристика': df.columns[1],
-                'Закупочная_цена': df.columns[2],
-                'РРЦ': df.columns[3]
-            }
-        else:
-            st.error("Не удалось определить колонки в файле цен. Ожидаются: Номенклатура, Характеристика, Закупочная_цена, РРЦ")
-            return pd.DataFrame()
+    if not all_data:
+        return pd.DataFrame()
     
-    # Переименовываем
-    df_renamed = df.rename(columns=col_map)
-    # Оставляем только нужные колонки
-    df_renamed = df_renamed[['Номенклатура', 'Характеристика', 'Закупочная_цена', 'РРЦ']]
-    # Приводим к числам
-    for col in ['Закупочная_цена', 'РРЦ']:
-        df_renamed[col] = pd.to_numeric(df_renamed[col], errors='coerce')
-    # Удаляем строки без цен
-    df_renamed = df_renamed.dropna(subset=['Закупочная_цена', 'РРЦ'], how='all')
-    return df_renamed
+    df_prices = pd.concat(all_data, ignore_index=True)
+    # Удаляем дубликаты по (Номенклатура, Характеристика) – оставляем первое вхождение
+    df_prices = df_prices.drop_duplicates(subset=['Номенклатура', 'Характеристика'], keep='first')
+    return df_prices
 
 
 # ------------------------------------------------------------
 # 4. Сопоставление товаров с прайс-листом (нечёткое через difflib)
 # ------------------------------------------------------------
-def match_prices(df_products, df_prices, threshold=0.6):
+def match_prices(df_products, df_prices, threshold=0.7):
     """
     Для каждого уникального товара (номенклатура + характеристика) из df_products
     ищет наиболее похожее название в df_prices с помощью difflib.
@@ -205,7 +223,7 @@ def match_prices(df_products, df_prices, threshold=0.6):
             idx = price_keys.index(best_match)
             matched_row = df_prices.iloc[price_indices[idx]]
             match_dict[(prod_row['Номенклатура'], prod_row['Характеристика'])] = (
-                matched_row['Закупочная_цена'],
+                matched_row['Себестоимость'],
                 matched_row['РРЦ']
             )
         # иначе пропускаем (цена не найдена)
@@ -488,7 +506,7 @@ use_prices = st.sidebar.checkbox("Использовать цены (Excel/CSV)"
 price_file = None
 if use_prices:
     price_file = st.sidebar.file_uploader("Загрузите файл с ценами", type=["xlsx", "csv"])
-    st.sidebar.caption("Ожидаются колонки: Номенклатура, Характеристика, Закупочная_цена, РРЦ")
+    st.sidebar.caption("Ожидаются колонки: Номенклатура, Характеристика, Себестоимость, РРЦ")
 
 st.markdown("---")
 st.write("Загрузите два Excel-файла: **первый** (предыдущий месяц) и **второй** (отчётный месяц).")
@@ -529,7 +547,7 @@ if st.button("🚀 Рассчитать KPI"):
                 if use_prices and price_file is not None:
                     df_prices = load_prices(price_file)
                     if not df_prices.empty:
-                        price_dict = match_prices(df_m2, df_prices, threshold=0.6)
+                        price_dict = match_prices(df_m2, df_prices, threshold=0.7)
                         if not price_dict:
                             st.warning("Не удалось сопоставить ни одного товара с прайс-листом. Проверьте названия.")
                     else:
